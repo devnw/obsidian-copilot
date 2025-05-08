@@ -51,6 +51,7 @@ export interface CopilotSettings {
   azureOpenAIApiEmbeddingDeploymentName: string;
   googleApiKey: string;
   openRouterAiApiKey: string;
+  xaiApiKey: string;
   mistralApiKey: string;
   deepseekApiKey: string;
   defaultChainType: ChainType;
@@ -93,6 +94,8 @@ export interface CopilotSettings {
   // undefined means never checked
   isPlusUser: boolean | undefined;
   inlineEditCommands: InlineEditCommandSettings[] | undefined;
+  passMarkdownImages: boolean;
+  enableCustomPromptTemplating: boolean;
 }
 
 export const settingsStore = createStore();
@@ -209,6 +212,16 @@ export function sanitizeSettings(settings: CopilotSettings): CopilotSettings {
   sanitizedSettings.embeddingBatchSize = isNaN(embeddingBatchSize)
     ? DEFAULT_SETTINGS.embeddingBatchSize
     : embeddingBatchSize;
+
+  // Ensure passMarkdownImages has a default value
+  if (typeof sanitizedSettings.passMarkdownImages !== "boolean") {
+    sanitizedSettings.passMarkdownImages = DEFAULT_SETTINGS.passMarkdownImages;
+  }
+
+  // Ensure enableCustomPromptTemplating has a default value
+  if (typeof sanitizedSettings.enableCustomPromptTemplating !== "boolean") {
+    sanitizedSettings.enableCustomPromptTemplating = DEFAULT_SETTINGS.enableCustomPromptTemplating;
+  }
 
   return sanitizedSettings;
 }
