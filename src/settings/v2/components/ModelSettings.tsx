@@ -1,12 +1,15 @@
-import React, { useState } from "react";
-import { SettingItem } from "@/components/ui/setting-item";
-import { setSettings, updateSetting, useSettingsValue } from "@/settings/model";
 import { CustomModel } from "@/aiParams";
-import ChatModelManager from "@/LLMProviders/chatModelManager";
+import { SettingItem } from "@/components/ui/setting-item";
+import { BUILTIN_CHAT_MODELS, BUILTIN_EMBEDDING_MODELS } from "@/constants";
 import EmbeddingManager from "@/LLMProviders/embeddingManager";
+import ProjectManager from "@/LLMProviders/projectManager";
+import { logError } from "@/logger";
+import { setSettings, updateSetting, useSettingsValue } from "@/settings/model";
 import { ModelAddDialog } from "@/settings/v2/components/ModelAddDialog";
-import { ModelTable } from "@/settings/v2/components/ModelTable";
 import { ModelEditDialog } from "@/settings/v2/components/ModelEditDialog";
+import { ModelTable } from "@/settings/v2/components/ModelTable";
+import { Notice } from "obsidian";
+import React, { useState } from "react";
 
 export const ModelSettings: React.FC = () => {
   const settings = useSettingsValue();
@@ -34,7 +37,22 @@ export const ModelSettings: React.FC = () => {
     });
   };
 
-  const handleModelUpdate = (updatedModel: CustomModel) => {
+  const handleModelUpdate = (originalModel: CustomModel, updatedModel: CustomModel) => {
+    const modelIndex = settings.activeModels.findIndex(
+      (m) => m.name === originalModel.name && m.provider === originalModel.provider
+    );
+    if (modelIndex !== -1) {
+      const updatedModels = [...settings.activeModels];
+      updatedModels[modelIndex] = updatedModel;
+      updateSetting("activeModels", updatedModels);
+    } else {
+      new Notice("Could not find model to update");
+      logError("Could not find model to update:", originalModel);
+    }
+  };
+
+  // Handler for updates originating from the ModelTable itself (e.g., checkbox toggles)
+  const handleTableUpdate = (updatedModel: CustomModel) => {
     const updatedModels = settings.activeModels.map((m) =>
       m.name === updatedModel.name && m.provider === updatedModel.provider ? updatedModel : m
     );
@@ -64,6 +82,30 @@ export const ModelSettings: React.FC = () => {
     updateSetting("activeEmbeddingModels", newModels);
   };
 
+  const handleRefreshChatModels = () => {
+    // Get all custom models (non-built-in models)
+    const customModels = settings.activeModels.filter((model) => !model.isBuiltIn);
+
+    // Create a new array with built-in models and custom models
+    const updatedModels = [...BUILTIN_CHAT_MODELS, ...customModels];
+
+    // Update the settings
+    updateSetting("activeModels", updatedModels);
+    new Notice("Chat models refreshed successfully");
+  };
+
+  const handleRefreshEmbeddingModels = () => {
+    // Get all custom models (non-built-in models)
+    const customModels = settings.activeEmbeddingModels.filter((model) => !model.isBuiltIn);
+
+    // Create a new array with built-in models and custom models
+    const updatedModels = [...BUILTIN_EMBEDDING_MODELS, ...customModels];
+
+    // Update the settings
+    updateSetting("activeEmbeddingModels", updatedModels);
+    new Notice("Embedding models refreshed successfully");
+  };
+
   return (
     <div className="space-y-4">
       <section>
@@ -73,8 +115,9 @@ export const ModelSettings: React.FC = () => {
           onEdit={setEditingModel}
           onDelete={onDeleteModel}
           onAdd={() => setShowAddDialog(true)}
-          onUpdateModel={handleModelUpdate}
+          onUpdateModel={handleTableUpdate}
           onReorderModels={handleModelReorder}
+          onRefresh={handleRefreshChatModels}
           title="Chat Model"
         />
 
@@ -94,7 +137,9 @@ export const ModelSettings: React.FC = () => {
             const updatedModels = [...settings.activeModels, model];
             updateSetting("activeModels", updatedModels);
           }}
-          ping={(model) => ChatModelManager.getInstance().ping(model)}
+          ping={(model) =>
+            ProjectManager.instance.getCurrentChainManager().chatModelManager.ping(model)
+          }
         />
 
         <div className="space-y-4">
@@ -151,6 +196,7 @@ export const ModelSettings: React.FC = () => {
           onAdd={() => setShowAddEmbeddingDialog(true)}
           onUpdateModel={handleEmbeddingModelUpdate}
           onReorderModels={handleEmbeddingModelReorder}
+          onRefresh={handleRefreshEmbeddingModels}
           title="Embedding Model"
         />
 
