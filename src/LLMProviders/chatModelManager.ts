@@ -1,4 +1,4 @@
-import { CustomModel, getModelKey, ModelConfig, setModelKey } from "@/aiParams";
+import { CustomModel, getModelKey, ModelConfig } from "@/aiParams";
 import {
   BREVILABS_API_BASE_URL,
   BUILTIN_CHAT_MODELS,
@@ -6,9 +6,9 @@ import {
   ProviderInfo,
 } from "@/constants";
 import { getDecryptedKey } from "@/encryptionService";
-import { logError } from "@/logger";
+import { logError, logInfo } from "@/logger";
 import { getModelKeyFromModel, getSettings, subscribeToSettingsChange } from "@/settings/model";
-import { err2String, isOSeriesModel, safeFetch } from "@/utils";
+import { err2String, isOSeriesModel, safeFetch, withSuppressedTokenWarnings } from "@/utils";
 import { HarmBlockThreshold, HarmCategory } from "@google/generative-ai";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { ChatCohere } from "@langchain/cohere";
@@ -19,6 +19,7 @@ import { ChatGroq } from "@langchain/groq";
 import { ChatMistralAI } from "@langchain/mistralai";
 import { ChatOllama } from "@langchain/ollama";
 import { ChatOpenAI } from "@langchain/openai";
+import { ChatXAI } from "@langchain/xai";
 import { Notice } from "obsidian";
 
 type ChatConstructorType = {
@@ -31,6 +32,7 @@ const CHAT_PROVIDER_CONSTRUCTORS = {
   [ChatModelProviders.ANTHROPIC]: ChatAnthropic,
   [ChatModelProviders.COHEREAI]: ChatCohere,
   [ChatModelProviders.GOOGLE]: ChatGoogleGenerativeAI,
+  [ChatModelProviders.XAI]: ChatXAI,
   [ChatModelProviders.OPENROUTERAI]: ChatOpenAI,
   [ChatModelProviders.OLLAMA]: ChatOllama,
   [ChatModelProviders.LM_STUDIO]: ChatOpenAI,
@@ -63,6 +65,7 @@ export default class ChatModelManager {
     [ChatModelProviders.COHEREAI]: () => getSettings().cohereApiKey,
     [ChatModelProviders.OPENROUTERAI]: () => getSettings().openRouterAiApiKey,
     [ChatModelProviders.GROQ]: () => getSettings().groqApiKey,
+    [ChatModelProviders.XAI]: () => getSettings().xaiApiKey,
     [ChatModelProviders.OLLAMA]: () => "default-key",
     [ChatModelProviders.LM_STUDIO]: () => "default-key",
     [ChatModelProviders.OPENAI_FORMAT]: () => "default-key",
@@ -91,14 +94,22 @@ export default class ChatModelManager {
 
     const modelName = customModel.name;
     const isOSeries = isOSeriesModel(modelName);
-    const baseConfig: Omit<ModelConfig, "maxTokens" | "maxCompletionTokens"> = {
+    const isThinkingEnabled =
+      modelName.startsWith("claude-3-7-sonnet") || modelName.startsWith("claude-sonnet-4");
+
+    // Base config without temperature when thinking is enabled
+    const baseConfig: Omit<ModelConfig, "maxTokens" | "maxCompletionTokens" | "temperature"> = {
       modelName: modelName,
-      temperature: customModel.temperature ?? settings.temperature,
       streaming: customModel.stream ?? true,
       maxRetries: 3,
       maxConcurrency: 3,
       enableCors: customModel.enableCors,
     };
+
+    // Add temperature only if thinking is not enabled
+    if (!isThinkingEnabled) {
+      (baseConfig as any).temperature = customModel.temperature ?? settings.temperature;
+    }
 
     const providerConfig: {
       [K in keyof ChatProviderConstructMap]: ConstructorParameters<ChatProviderConstructMap[K]>[0];
@@ -115,20 +126,27 @@ export default class ChatModelManager {
       },
       [ChatModelProviders.ANTHROPIC]: {
         anthropicApiKey: await getDecryptedKey(customModel.apiKey || settings.anthropicApiKey),
-        modelName: modelName,
+        model: modelName,
         anthropicApiUrl: customModel.baseUrl,
         clientOptions: {
           // Required to bypass CORS restrictions
-          defaultHeaders: { "anthropic-dangerous-direct-browser-access": "true" },
+          defaultHeaders: {
+            "anthropic-dangerous-direct-browser-access": "true",
+          },
           fetch: customModel.enableCors ? safeFetch : undefined,
         },
+        ...(isThinkingEnabled && {
+          thinking: { type: "enabled", budget_tokens: 1024 },
+        }),
       },
       [ChatModelProviders.AZURE_OPENAI]: {
         modelName:
           customModel.azureOpenAIApiDeploymentName || settings.azureOpenAIApiDeploymentName,
         openAIApiKey: await getDecryptedKey(customModel.apiKey || settings.azureOpenAIApiKey),
         configuration: {
-          baseURL: `https://${customModel.azureOpenAIApiInstanceName || settings.azureOpenAIApiInstanceName}.openai.azure.com/openai/deployments/${customModel.azureOpenAIApiDeploymentName || settings.azureOpenAIApiDeploymentName}`,
+          baseURL:
+            customModel.baseUrl ||
+            `https://${customModel.azureOpenAIApiInstanceName || settings.azureOpenAIApiInstanceName}.openai.azure.com/openai/deployments/${customModel.azureOpenAIApiDeploymentName || settings.azureOpenAIApiDeploymentName}`,
           defaultQuery: {
             "api-version": customModel.azureOpenAIApiVersion || settings.azureOpenAIApiVersion,
           },
@@ -167,6 +185,11 @@ export default class ChatModelManager {
         ],
         baseUrl: customModel.baseUrl,
       },
+      [ChatModelProviders.XAI]: {
+        apiKey: await getDecryptedKey(customModel.apiKey || settings.xaiApiKey),
+        model: modelName,
+        // This langchainjs XAI client does not support baseURL override
+      },
       [ChatModelProviders.OPENROUTERAI]: {
         modelName: modelName,
         openAIApiKey: await getDecryptedKey(customModel.apiKey || settings.openRouterAiApiKey),
@@ -182,10 +205,11 @@ export default class ChatModelManager {
       [ChatModelProviders.OLLAMA]: {
         // ChatOllama has `model` instead of `modelName`!!
         model: modelName,
-        // @ts-ignore
-        apiKey: customModel.apiKey || "default-key",
         // MUST NOT use /v1 in the baseUrl for ollama
         baseUrl: customModel.baseUrl || "http://localhost:11434",
+        headers: new Headers({
+          Authorization: `Bearer ${await getDecryptedKey(customModel.apiKey || "default-key")}`,
+        }),
       },
       [ChatModelProviders.LM_STUDIO]: {
         modelName: modelName,
@@ -232,24 +256,39 @@ export default class ChatModelManager {
       providerConfig[customModel.provider as keyof typeof providerConfig] || {};
 
     // Add token configuration separately to ensure they don't conflict
-    const tokenConfig = this.handleOpenAIExtraArgs(
-      isOSeries,
-      customModel.maxTokens ?? settings.maxTokens,
-      customModel.temperature ?? settings.temperature
-    );
+    const tokenConfig = isThinkingEnabled
+      ? {
+          maxTokens: customModel.maxTokens ?? settings.maxTokens,
+        }
+      : this.handleOpenAIExtraArgs(
+          isOSeries,
+          customModel.maxTokens ?? settings.maxTokens,
+          customModel.temperature ?? settings.temperature
+        );
 
-    return {
+    const finalConfig = {
       ...baseConfig,
       ...selectedProviderConfig,
       ...tokenConfig,
     };
+
+    // Final safety check to ensure no temperature when thinking is enabled
+    if (isThinkingEnabled) {
+      delete finalConfig.temperature;
+    }
+
+    return finalConfig as ModelConfig;
   }
 
-  private handleOpenAIExtraArgs(isOSeriesModel: boolean, maxTokens: number, temperature: number) {
+  private handleOpenAIExtraArgs(
+    isOSeriesModel: boolean,
+    maxTokens: number,
+    temperature: number | undefined
+  ) {
     const config = isOSeriesModel
       ? {
           maxCompletionTokens: maxTokens,
-          temperature: 1,
+          temperature: temperature === undefined ? undefined : 1,
         }
       : {
           maxTokens: maxTokens,
@@ -306,7 +345,6 @@ export default class ChatModelManager {
 
   async setChatModel(model: CustomModel): Promise<void> {
     const modelKey = getModelKeyFromModel(model);
-    setModelKey(modelKey);
     try {
       const modelInstance = await this.createModelInstance(model);
       ChatModelManager.chatModel = modelInstance;
@@ -344,8 +382,31 @@ export default class ChatModelManager {
     return true;
   }
 
+  // Custom token estimation function for fallback when model is unknown
+  private estimateTokens(text: string): number {
+    if (!text) return 0;
+    // This is a simple approximation: ~4 chars per token for English text
+    // More accurate than using word count, but still a decent estimation
+    return Math.ceil(text.length / 4);
+  }
+
   async countTokens(inputStr: string): Promise<number> {
-    return ChatModelManager.chatModel?.getNumTokens(inputStr) ?? 0;
+    try {
+      return await withSuppressedTokenWarnings(async () => {
+        return ChatModelManager.chatModel?.getNumTokens(inputStr) ?? 0;
+      });
+    } catch (error) {
+      // If there's an error calculating tokens, use a simple approximation instead
+      // This prevents "Unknown model" errors from appearing in the console
+      if (error instanceof Error && error.message.includes("Unknown model")) {
+        // Simple approximation: 1 token ~= 4 characters for English text
+        logInfo("Using estimated token count due to tokenizer error");
+        // Fall back to our estimation if LangChain's method fails
+        return this.estimateTokens(inputStr);
+      }
+      // For other errors, rethrow
+      throw error;
+    }
   }
 
   private validateCurrentModel(): void {
