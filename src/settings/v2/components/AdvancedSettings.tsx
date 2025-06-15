@@ -1,12 +1,13 @@
-import React from "react";
 import { SettingItem } from "@/components/ui/setting-item";
 import { updateSetting, useSettingsValue } from "@/settings/model";
+import { PromptSortStrategy } from "@/types";
+import React from "react";
 
 export const AdvancedSettings: React.FC = () => {
   const settings = useSettingsValue();
 
   return (
-    <div className="space-y-4">
+    <div className="tw-space-y-4">
       {/* Privacy Settings Section */}
       <section>
         <SettingItem
@@ -18,7 +19,29 @@ export const AdvancedSettings: React.FC = () => {
           placeholder="Enter your system prompt here..."
         />
 
-        <div className="space-y-4">
+        <div className="tw-space-y-4">
+          <SettingItem
+            type="switch"
+            title="Custom Prompt Templating"
+            description="Enable templating to process variables like {activenote}, {foldername} or {#tag} in prompts. Disable to use raw prompts without any processing."
+            checked={settings.enableCustomPromptTemplating}
+            onCheckedChange={(checked) => {
+              updateSetting("enableCustomPromptTemplating", checked);
+            }}
+          />
+
+          <SettingItem
+            type="select"
+            title="Custom Prompts Sort Strategy"
+            description="Choose how to sort custom prompts (by recent usage or alphabetically)"
+            value={settings.promptSortStrategy}
+            onChange={(value) => updateSetting("promptSortStrategy", value)}
+            options={[
+              { label: "Recency", value: PromptSortStrategy.TIMESTAMP },
+              { label: "Alphabetical", value: PromptSortStrategy.ALPHABETICAL },
+            ]}
+          />
+
           <SettingItem
             type="switch"
             title="Enable Encryption"

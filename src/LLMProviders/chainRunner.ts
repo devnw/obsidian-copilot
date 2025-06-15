@@ -1,3 +1,4 @@
+import { getCurrentProject } from "@/aiParams";
 import { getStandaloneQuestion } from "@/chainUtils";
 import {
   ABORT_REASON,
@@ -7,9 +8,15 @@ import {
   MAX_CHARS_FOR_LOCAL_SEARCH_CONTEXT,
   ModelCapability,
 } from "@/constants";
+import {
+  ImageBatchProcessor,
+  ImageContent,
+  ImageProcessingResult,
+  MessageContent,
+} from "@/imageProcessing/imageProcessor";
 import { BrevilabsClient } from "@/LLMProviders/brevilabsClient";
-import { logError } from "@/logger";
-import { getSystemPrompt } from "@/settings/model";
+import { logInfo } from "@/logger";
+import { getSettings, getSystemPrompt } from "@/settings/model";
 import { ChatMessage } from "@/sharedState";
 import { ToolManager } from "@/tools/toolManager";
 import {
@@ -20,14 +27,13 @@ import {
   formatDateTime,
   getApiErrorMessage,
   getMessageRole,
-  ImageContent,
-  ImageProcessor,
-  MessageContent,
+  withSuppressedTokenWarnings,
 } from "@/utils";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { Notice } from "obsidian";
 import ChainManager from "./chainManager";
 import { COPILOT_TOOL_NAMES, IntentAnalyzer } from "./intentAnalyzer";
+import ProjectManager from "./projectManager";
 
 class ThinkBlockStreamer {
   private hasOpenThinkBlock = false;
@@ -35,19 +41,60 @@ class ThinkBlockStreamer {
 
   constructor(private updateCurrentAiMessage: (message: string) => void) {}
 
-  processChunk(chunk: any) {
-    this.fullResponse += chunk.content;
+  private handleClaude37Chunk(content: any[]) {
+    let textContent = "";
+    for (const item of content) {
+      switch (item.type) {
+        case "text":
+          textContent += item.text;
+          break;
+        case "thinking":
+          if (!this.hasOpenThinkBlock) {
+            this.fullResponse += "\n<think>";
+            this.hasOpenThinkBlock = true;
+          }
+          this.fullResponse += item.thinking;
+          this.updateCurrentAiMessage(this.fullResponse);
+          return true; // Indicate we handled a thinking chunk
+      }
+    }
+    if (textContent) {
+      this.fullResponse += textContent;
+    }
+    return false; // No thinking chunk handled
+  }
 
+  private handleDeepseekChunk(chunk: any) {
+    // Handle standard string content
+    if (typeof chunk.content === "string") {
+      this.fullResponse += chunk.content;
+    }
+
+    // Handle deepseek reasoning/thinking content
     if (chunk.additional_kwargs?.reasoning_content) {
-      // If we don't have an open think block, add one
       if (!this.hasOpenThinkBlock) {
         this.fullResponse += "\n<think>";
         this.hasOpenThinkBlock = true;
       }
-      // Add the new reasoning content
       this.fullResponse += chunk.additional_kwargs.reasoning_content;
-    } else if (this.hasOpenThinkBlock) {
-      // If we have an open think block but no more reasoning content, close it
+      return true; // Indicate we handled a thinking chunk
+    }
+    return false; // No thinking chunk handled
+  }
+
+  processChunk(chunk: any) {
+    let handledThinking = false;
+
+    // Handle Claude 3.7 array-based content
+    if (Array.isArray(chunk.content)) {
+      handledThinking = this.handleClaude37Chunk(chunk.content);
+    } else {
+      // Handle deepseek format
+      handledThinking = this.handleDeepseekChunk(chunk);
+    }
+
+    // Close think block if we have one open and didn't handle thinking content
+    if (this.hasOpenThinkBlock && !handledThinking) {
       this.fullResponse += "</think>";
       this.hasOpenThinkBlock = false;
     }
@@ -80,7 +127,11 @@ export interface ChainRunner {
 }
 
 abstract class BaseChainRunner implements ChainRunner {
-  constructor(protected chainManager: ChainManager) {}
+  protected chainManager: ChainManager;
+
+  constructor(chainManager: ChainManager) {
+    this.chainManager = chainManager;
+  }
 
   abstract run(
     userMessage: ChatMessage,
@@ -201,7 +252,7 @@ class LLMChainRunner extends BaseChainRunner {
     const streamer = new ThinkBlockStreamer(updateCurrentAiMessage);
 
     try {
-      const chain = ChainManager.getChain();
+      const chain = this.chainManager.getChain();
       const chatStream = await chain.stream({
         input: userMessage.message,
       } as any);
@@ -257,7 +308,7 @@ class VaultQAChainRunner extends BaseChainRunner {
       const memory = this.chainManager.memoryManager.getMemory();
       const memoryVariables = await memory.loadMemoryVariables({});
       const chatHistory = extractChatHistory(memoryVariables);
-      const qaStream = await ChainManager.getRetrievalChain().stream({
+      const qaStream = await this.chainManager.getRetrievalChain().stream({
         question: userMessage.message,
         chat_history: chatHistory,
       } as any);
@@ -284,7 +335,7 @@ class VaultQAChainRunner extends BaseChainRunner {
   }
 
   private addSourcestoResponse(response: string): string {
-    const docTitles = extractUniqueTitlesFromDocs(ChainManager.retrievedDocuments);
+    const docTitles = extractUniqueTitlesFromDocs(this.chainManager.getRetrievedDocuments());
     if (docTitles.length > 0) {
       const links = docTitles.map((title) => `- [[${title}]]`).join("\n");
       response += "\n\n#### Sources:\n\n" + links;
@@ -307,58 +358,26 @@ class CopilotPlusChainRunner extends BaseChainRunner {
     return hasYoutubeCommand && youtubeUrl !== null && words.length === 1;
   }
 
-  private async processImageUrls(urls: string[]): Promise<ImageContent[]> {
-    try {
-      const imageUrls = await Promise.all(
-        urls.map(async (url) => {
-          if (await ImageProcessor.isImageUrl(url, this.chainManager.app.vault)) {
-            const imageContent = await ImageProcessor.convertToBase64(
-              url,
-              this.chainManager.app.vault
-            );
-            if (!imageContent) {
-              logError(`Failed to process image: ${url}`);
-              return null;
-            }
-            return imageContent;
-          }
-          return null;
-        })
-      );
-
-      // Filter out null values and return valid image URLs
-      const validImages = imageUrls.filter((item): item is ImageContent => item !== null);
-      return validImages;
-    } catch (error) {
-      logError("Error processing image URLs:", error);
-      return [];
-    }
+  private async processImageUrls(urls: string[]): Promise<ImageProcessingResult> {
+    const failedImages: string[] = [];
+    const processedImages = await ImageBatchProcessor.processUrlBatch(
+      urls,
+      failedImages,
+      this.chainManager.app.vault
+    );
+    ImageBatchProcessor.showFailedImagesNotice(failedImages);
+    return processedImages;
   }
 
-  private async processExistingImages(content: MessageContent[]): Promise<ImageContent[]> {
-    try {
-      const imageContent = await Promise.all(
-        content
-          .filter(
-            (item): item is ImageContent => item.type === "image_url" && !!item.image_url?.url
-          )
-          .map(async (item) => {
-            const processedContent = await ImageProcessor.convertToBase64(
-              item.image_url.url,
-              this.chainManager.app.vault
-            );
-            if (!processedContent) {
-              logError(`Failed to process existing image: ${item.image_url.url}`);
-              return null;
-            }
-            return processedContent;
-          })
-      );
-      return imageContent.filter((item): item is ImageContent => item !== null);
-    } catch (error) {
-      logError("Error processing images:", error);
-      return [];
-    }
+  private async processChatInputImages(content: MessageContent[]): Promise<ImageProcessingResult> {
+    const failedImages: string[] = [];
+    const processedImages = await ImageBatchProcessor.processChatImageBatch(
+      content,
+      failedImages,
+      this.chainManager.app.vault
+    );
+    ImageBatchProcessor.showFailedImagesNotice(failedImages);
+    return processedImages;
   }
 
   private async extractEmbeddedImages(content: string): Promise<string[]> {
@@ -372,33 +391,61 @@ class CopilotPlusChainRunner extends BaseChainRunner {
     textContent: string,
     userMessage: ChatMessage
   ): Promise<MessageContent[]> {
-    const content: MessageContent[] = [
+    const failureMessages: string[] = [];
+    const successfulImages: ImageContent[] = [];
+    const settings = getSettings();
+
+    // Collect all image sources
+    const imageSources: { urls: string[]; type: string }[] = [];
+
+    // Safely check and add context URLs
+    const contextUrls = userMessage.context?.urls;
+    if (contextUrls && contextUrls.length > 0) {
+      imageSources.push({ urls: contextUrls, type: "context" });
+    }
+
+    // Process embedded images only if setting is enabled
+    if (settings.passMarkdownImages) {
+      const embeddedImages = await this.extractEmbeddedImages(textContent);
+      if (embeddedImages.length > 0) {
+        imageSources.push({ urls: embeddedImages, type: "embedded" });
+      }
+    }
+
+    // Process all image sources
+    for (const source of imageSources) {
+      const result = await this.processImageUrls(source.urls);
+      successfulImages.push(...result.successfulImages);
+      failureMessages.push(...result.failureDescriptions);
+    }
+
+    // Process existing chat content images if present
+    const existingContent = userMessage.content;
+    if (existingContent && existingContent.length > 0) {
+      const result = await this.processChatInputImages(existingContent);
+      successfulImages.push(...result.successfulImages);
+      failureMessages.push(...result.failureDescriptions);
+    }
+
+    // Let the LLM know about the image processing failures
+    let finalText = textContent;
+    if (failureMessages.length > 0) {
+      finalText = `${textContent}\n\nNote: \n${failureMessages.join("\n")}\n`;
+    }
+
+    const messageContent: MessageContent[] = [
       {
         type: "text",
-        text: textContent,
+        text: finalText,
       },
     ];
 
-    // Process URLs in the message to identify images
-    if (userMessage.context?.urls && userMessage.context.urls.length > 0) {
-      const imageContents = await this.processImageUrls(userMessage.context.urls);
-      content.push(...imageContents);
+    // Add successful images after the text content
+    if (successfulImages.length > 0) {
+      messageContent.push(...successfulImages);
     }
 
-    // Process embedded images from the text content
-    const embeddedImages = await this.extractEmbeddedImages(textContent);
-    if (embeddedImages.length > 0) {
-      const imageContents = await this.processImageUrls(embeddedImages);
-      content.push(...imageContents);
-    }
-
-    // Add existing image content if present
-    if (userMessage.content && userMessage.content.length > 0) {
-      const imageContents = await this.processExistingImages(userMessage.content);
-      content.push(...imageContents);
-    }
-
-    return content;
+    return messageContent;
   }
 
   private hasCapability(model: BaseChatModel, capability: ModelCapability): boolean {
@@ -427,7 +474,7 @@ class CopilotPlusChainRunner extends BaseChainRunner {
     const messages: any[] = [];
 
     // Add system message if available
-    let fullSystemMessage = getSystemPrompt();
+    let fullSystemMessage = await this.getSystemPrompt();
 
     // Add chat history context to system message if exists
     if (chatHistory.length > 0) {
@@ -447,9 +494,8 @@ class CopilotPlusChainRunner extends BaseChainRunner {
     }
 
     // Add chat history
-    for (const [human, ai] of chatHistory) {
-      messages.push({ role: "user", content: human });
-      messages.push({ role: "assistant", content: ai });
+    for (const entry of chatHistory) {
+      messages.push({ role: entry.role, content: entry.content });
     }
 
     // Get the current chat model
@@ -467,13 +513,15 @@ class CopilotPlusChainRunner extends BaseChainRunner {
       content,
     });
 
-    // Add debug logging for final request
-    if (debug) {
-      console.log("==== Final Request to AI ====\n", messages);
-    }
-
+    const enhancedUserMessage = content instanceof Array ? (content[0] as any).text : content;
+    logInfo("Enhanced user message: ", enhancedUserMessage);
+    logInfo("==== Final Request to AI ====\n", messages);
     const streamer = new ThinkBlockStreamer(updateCurrentAiMessage);
-    const chatStream = await this.chainManager.chatModelManager.getChatModel().stream(messages);
+
+    // Wrap the stream call with warning suppression
+    const chatStream = await withSuppressedTokenWarnings(() =>
+      this.chainManager.chatModelManager.getChatModel().stream(messages)
+    );
 
     for await (const chunk of chatStream) {
       if (abortController.signal.aborted) break;
@@ -542,9 +590,9 @@ class CopilotPlusChainRunner extends BaseChainRunner {
 
       if (debug) console.log("==== Step 1: Analyzing intent ====");
       let toolCalls;
+      // Use the original message for intent analysis
+      const messageForAnalysis = userMessage.originalMessage || userMessage.message;
       try {
-        // Use the original message for intent analysis
-        const messageForAnalysis = userMessage.originalMessage || userMessage.message;
         toolCalls = await IntentAnalyzer.analyzeIntent(messageForAnalysis);
       } catch (error: any) {
         return this.handleResponse(
@@ -569,14 +617,14 @@ class CopilotPlusChainRunner extends BaseChainRunner {
         (output) => output.tool === "localSearch" && output.output && output.output.length > 0
       );
 
+      // Format chat history from memory
+      const memory = this.chainManager.memoryManager.getMemory();
+      const memoryVariables = await memory.loadMemoryVariables({});
+      const chatHistory = extractChatHistory(memoryVariables);
+
       if (localSearchResult) {
         if (debug) console.log("==== Step 2: Processing local search results ====");
         const documents = JSON.parse(localSearchResult.output);
-
-        // Format chat history from memory
-        const memory = this.chainManager.memoryManager.getMemory();
-        const memoryVariables = await memory.loadMemoryVariables({});
-        const chatHistory = extractChatHistory(memoryVariables);
 
         if (debug) console.log("==== Step 3: Condensing Question ====");
         const standaloneQuestion = await getStandaloneQuestion(cleanedUserMessage, chatHistory);
@@ -596,7 +644,7 @@ class CopilotPlusChainRunner extends BaseChainRunner {
         if (debug) console.log("==== Step 5: Invoking QA Chain ====");
         const qaPrompt = await this.chainManager.promptManager.getQAPrompt({
           question: enhancedQuestion,
-          context: context,
+          context,
           systemMessage: "", // System prompt is added separately in streamMultimodalResponse
         });
 
@@ -611,15 +659,13 @@ class CopilotPlusChainRunner extends BaseChainRunner {
         // Append sources to the response
         sources = this.getSources(documents);
       } else {
+        // Enhance with tool outputs.
         const enhancedUserMessage = this.prepareEnhancedUserMessage(
           cleanedUserMessage,
           toolOutputs
         );
         // If no results, default to LLM Chain
-        if (debug) {
-          console.log("No local search results. Using standard LLM Chain.");
-          console.log("Enhanced user message:", enhancedUserMessage);
-        }
+        logInfo("No local search results. Using standard LLM Chain.");
 
         fullAIResponse = await this.streamMultimodalResponse(
           enhancedUserMessage,
@@ -720,7 +766,7 @@ class CopilotPlusChainRunner extends BaseChainRunner {
             .join("\n\n");
       }
     }
-    return `User message: ${userMessage}${context}`;
+    return `${userMessage}${context}`;
   }
 
   private getTimeExpression(toolCalls: any[]): string {
@@ -754,6 +800,31 @@ class CopilotPlusChainRunner extends BaseChainRunner {
       ? `Local Search Result for ${timeExpression}:\n${formattedDocs}`
       : `Local Search Result:\n${formattedDocs}`;
   }
+
+  protected async getSystemPrompt(): Promise<string> {
+    return getSystemPrompt();
+  }
 }
 
-export { CopilotPlusChainRunner, LLMChainRunner, VaultQAChainRunner };
+class ProjectChainRunner extends CopilotPlusChainRunner {
+  protected async getSystemPrompt(): Promise<string> {
+    let finalPrompt = getSystemPrompt();
+    const projectConfig = getCurrentProject();
+    if (!projectConfig) {
+      return finalPrompt;
+    }
+
+    // Get context asynchronously
+    const context = await ProjectManager.instance.getProjectContext(projectConfig.id);
+    finalPrompt = `${finalPrompt}\n\n<project_system_prompt>\n${projectConfig.systemPrompt}\n</project_system_prompt>`;
+
+    // TODO: Move project context out of the system prompt and into the user prompt.
+    if (context) {
+      finalPrompt = `${finalPrompt}\n\n <project_context>\n${context}\n</project_context>`;
+    }
+
+    return finalPrompt;
+  }
+}
+
+export { CopilotPlusChainRunner, LLMChainRunner, ProjectChainRunner, VaultQAChainRunner };
